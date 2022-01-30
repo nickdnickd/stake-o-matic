@@ -529,7 +529,7 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
                         .map(|_| ())
                         .map_err(|e| format!("{}", e))
                 })
-                .help("How validators with infrastruction concentration above \
+                .help("How validators with infrastructure concentration above \
                        `max_infrastructure_concentration` will be affected. \
                        Accepted values are:\n\
                        1) warn         - Stake unaffected. A warning message is notified\n\
