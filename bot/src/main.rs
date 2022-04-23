@@ -34,7 +34,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         error,
-        fs::{self, File},
+        fs::File,
         io::Write,
         path::PathBuf,
         process,
@@ -202,11 +202,12 @@ impl std::fmt::Display for Cluster {
 pub struct Config {
     json_rpc_url: String,
     websocket_url: String,
+    participant_json_rpc_url: String,
     cluster: Cluster,
     db_path: PathBuf,
     db_suffix: String,
     require_classification: bool,
-    markdown_mode: OutputMode,
+    csv_output_mode: OutputMode,
     epoch_classification: OutputMode,
 
     /// Perform all stake processing, without sending transactions to the network
@@ -248,6 +249,8 @@ pub struct Config {
     /// 2) "destake"    - Removes all validator stake
     /// 3) PATH_TO_YAML - Reads a list of validator identity pubkeys from the specified YAML file
     ///                   destaking those in the list and warning any others
+    /// 4) "destake-new" - When infrastructure concentration is too high, only destake validators
+    ///                    who are new to the data center
     infrastructure_concentration_affects: InfrastructureConcentrationAffects,
 
     bad_cluster_average_skip_rate: usize,
@@ -282,18 +285,22 @@ pub struct Config {
     baseline_stake_amount_lamports: Option<u64>,
 }
 
+const DEFAULT_MAINNET_BETA_JSON_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+const DEFAULT_TESTNET_JSON_RPC_URL: &str = "https://api.testnet.solana.com";
+
 impl Config {
     #[cfg(test)]
     pub fn default_for_test() -> Self {
         Self {
-            json_rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
+            json_rpc_url: DEFAULT_MAINNET_BETA_JSON_RPC_URL.to_string(),
             websocket_url: solana_cli_config::Config::compute_websocket_url(
-                "https://api.mainnet-beta.solana.com",
+                DEFAULT_MAINNET_BETA_JSON_RPC_URL,
             ),
+            participant_json_rpc_url: DEFAULT_MAINNET_BETA_JSON_RPC_URL.to_string(),
             cluster: Cluster::MainnetBeta,
             db_path: PathBuf::default(),
             db_suffix: "".to_string(),
-            markdown_mode: OutputMode::No,
+            csv_output_mode: OutputMode::No,
             epoch_classification: OutputMode::No,
             require_classification: false,
             dry_run: true,
@@ -368,6 +375,15 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
                 .help("JSON RPC URL for the cluster")
         )
         .arg(
+            Arg::with_name("participant_json_rpc_url")
+                .long("participant-url")
+                .value_name("URL")
+                .takes_value(true)
+                .validator(is_url)
+                .default_value(DEFAULT_MAINNET_BETA_JSON_RPC_URL)
+                .help("JSON RPC URL for the participant cluster, typically a mainnet URL")
+        )
+        .arg(
             Arg::with_name("cluster")
                 .long("cluster")
                 .value_name("NAME")
@@ -384,13 +400,13 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
                 .help("Confirm that the stake adjustments should actually be made")
         )
         .arg(
-            Arg::with_name("markdown")
-                .long("markdown")
+            Arg::with_name("csv-output-mode")
+                .long("csv-output-mode")
                 .value_name("no|yes|first")
                 .takes_value(true)
                 .default_value("no")
                 .possible_values(&["no", "yes", "first"])
-                .help("Output markdown.  If \"first\", markdown will only be generated on the first run.  If \"yes\", markdown will always be generated. If \"no\", no markdown is ever generated.")
+                .help("Output summary CSV.  If \"first\", CSV will only be generated on the first run.  If \"yes\", CSV will always be generated. If \"no\", no CSV is ever generated.")
         )
         .arg(
             Arg::with_name("epoch_classification")
@@ -664,7 +680,7 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
                 )
         )
         .subcommand(
-            SubCommand::with_name("noop-stake-pool").about("Use a no-op stake pool.  Useful for testing classification and generating markdown from an existing db.")
+            SubCommand::with_name("noop-stake-pool").about("Use a no-op stake pool.  Useful for testing classification and generating output from an existing db.")
         )
         .get_matches();
 
@@ -699,16 +715,9 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
         process::exit(1);
     }
 
-    let json_rpc_url = match cluster {
-        Cluster::MainnetBeta => value_t!(matches, "json_rpc_url", String)
-            .unwrap_or_else(|_| "http://api.mainnet-beta.solana.com".into()),
-        Cluster::Testnet => value_t!(matches, "json_rpc_url", String)
-            .unwrap_or_else(|_| "http://api.testnet.solana.com".into()),
-    };
-    let websocket_url = solana_cli_config::Config::compute_websocket_url(&json_rpc_url);
     let db_path = value_t_or_exit!(matches, "db_path", PathBuf);
     let db_suffix = matches.value_of("db_suffix").unwrap().to_string();
-    let markdown_mode = match value_t_or_exit!(matches, "markdown", String).as_str() {
+    let csv_output_mode = match value_t_or_exit!(matches, "csv-output-mode", String).as_str() {
         "first" => OutputMode::First,
         "yes" => OutputMode::Yes,
         "no" => OutputMode::No,
@@ -739,14 +748,63 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
     )
     .unwrap();
 
+    let default_json_rpc_url = match cluster {
+        Cluster::MainnetBeta => DEFAULT_MAINNET_BETA_JSON_RPC_URL,
+        Cluster::Testnet => DEFAULT_TESTNET_JSON_RPC_URL,
+    }
+    .to_string();
+
+    // Create a list of RPC URLs to try. If a URL is specified on the command-line, try that first.
+    // If the URL specified on the command-line is not "healthy," or if no URL was specified on the
+    // command-line, fall back to the public solana.com RPC url.
+    let json_rpc_urls_to_try: Vec<String> = match value_t!(matches, "json_rpc_url", String) {
+        Ok(url) => {
+            if url.eq(&default_json_rpc_url) {
+                vec![default_json_rpc_url]
+            } else {
+                vec![url, default_json_rpc_url]
+            }
+        }
+        _ => {
+            vec![default_json_rpc_url]
+        }
+    };
+
+    let (rpc_client, json_rpc_url) = json_rpc_urls_to_try
+        .iter()
+        .map(|url| {
+            let rpc_client = Arc::new(RpcClient::new_with_timeout(
+                url.clone(),
+                Duration::from_secs(180),
+            ));
+            (rpc_client, url.clone())
+        })
+        .find(|(rpc_client, url)| {
+            info!("Checking health of {}", url);
+            matches!(check_rpc_health(rpc_client), Ok(_))
+        })
+        .unwrap_or_else(|| {
+            error!("All RPC servers are unhealthy. Exiting.");
+            process::exit(1);
+        });
+
+    info!("using RPC URL: {}", json_rpc_url);
+
+    let websocket_url = solana_cli_config::Config::compute_websocket_url(&json_rpc_url);
+    let participant_json_rpc_url = matches
+        .value_of("participant_json_rpc_url")
+        .unwrap()
+        .to_string();
+
     let mut config = Config {
         json_rpc_url,
         websocket_url,
+        participant_json_rpc_url,
         cluster,
         db_path,
         db_suffix,
         require_classification,
-        markdown_mode,
+        csv_output_mode,
         epoch_classification,
         dry_run,
         quality_block_producer_percentage,
@@ -767,39 +825,6 @@ fn get_config() -> BoxResult<(Config, Arc<RpcClient>, Box<dyn GenericStakePool>)
         min_testnet_participation,
         baseline_stake_amount_lamports: None,
     };
-
-    info!("RPC URL: {}", config.json_rpc_url);
-    let rpc_client = Arc::new(RpcClient::new_with_timeout(
-        config.json_rpc_url.clone(),
-        Duration::from_secs(180),
-    ));
-
-    // Sanity check that the RPC endpoint is healthy before performing too much work
-    {
-        let mut retries = 12u8;
-        let retry_delay = Duration::from_secs(10);
-        loop {
-            match rpc_client.get_health() {
-                Ok(()) => {
-                    info!("RPC endpoint healthy");
-                    break;
-                }
-                Err(err) => {
-                    warn!("RPC endpoint is unhealthy: {:?}", err);
-                }
-            }
-            if retries == 0 {
-                process::exit(1);
-            }
-            retries = retries.saturating_sub(1);
-            info!(
-                "{} retries remaining, sleeping for {} seconds",
-                retries,
-                retry_delay.as_secs()
-            );
-            std::thread::sleep(retry_delay);
-        }
-    }
 
     let stake_pool: Box<dyn GenericStakePool> = match matches.subcommand() {
         ("stake-pool-v0", Some(matches)) => {
@@ -1374,9 +1399,8 @@ fn classify(
                 .cloned()
                 .unwrap_or_default();
 
-            let previous_classification = previous_epoch_validator_classifications
-                .map(|p| p.get(&identity))
-                .flatten();
+            let previous_classification =
+                previous_epoch_validator_classifications.and_then(|p| p.get(&identity));
 
             let commission_at_end_of_epoch = calculate_commission_at_end_of_epoch(
                 epoch,
@@ -1384,8 +1408,7 @@ fn classify(
                 all_commission_changes.get(&vote_address),
             );
             let num_epochs_max_commission_exceeded = previous_classification
-                .map(|vc| vc.num_epochs_max_commission_exceeded)
-                .flatten()
+                .and_then(|vc| vc.num_epochs_max_commission_exceeded)
                 .unwrap_or(0)
                 + (if commission_at_end_of_epoch > config.max_commission {
                     1
@@ -1394,8 +1417,7 @@ fn classify(
                 });
 
             let mut previous_data_center_residency = previous_classification
-                .map(|vc| vc.data_center_residency.clone())
-                .flatten()
+                .and_then(|vc| vc.data_center_residency.clone())
                 .unwrap_or_default();
 
             let previous_stake_state = previous_classification
@@ -1441,22 +1463,22 @@ fn classify(
                 validator_notes.push(insufficent_self_stake_msg.clone());
             }
 
-            let insufficent_testnet_participation = testnet_participation
-                .as_ref()
-                .map(|testnet_participation| {
-                    if let Some(participant) = participant {
-                        if !testnet_participation.get(&participant).unwrap_or(&true) {
-                            let note = "Insufficient testnet participation".to_string();
-                            if config.enforce_testnet_participation {
-                                return Some(note);
-                            } else {
-                                validator_notes.push(note);
+            let insufficent_testnet_participation =
+                testnet_participation
+                    .as_ref()
+                    .and_then(|testnet_participation| {
+                        if let Some(participant) = participant {
+                            if !testnet_participation.get(&participant).unwrap_or(&true) {
+                                let note = "Insufficient testnet participation".to_string();
+                                if config.enforce_testnet_participation {
+                                    return Some(note);
+                                } else {
+                                    validator_notes.push(note);
+                                }
                             }
                         }
-                    }
-                    None
-                })
-                .flatten();
+                        None
+                    });
 
             let (stake_state, reason) = if let Some(reason) =
                 infrastructure_concentration_destake_reason
@@ -1580,8 +1602,7 @@ fn classify(
             );
 
             let mut stake_states = previous_classification
-                .map(|vc| vc.stake_states.clone())
-                .flatten()
+                .and_then(|vc| vc.stake_states.clone())
                 .unwrap_or_default();
             stake_states.insert(0, (stake_state, reason.clone()));
 
@@ -1671,7 +1692,7 @@ fn main() -> BoxResult<()> {
 
     info!("Loading participants...");
     let participants = get_participants_with_state(
-        &RpcClient::new("https://api.mainnet-beta.solana.com".to_string()),
+        &RpcClient::new(config.participant_json_rpc_url.clone()),
         Some(ParticipantState::Approved),
     )?;
 
@@ -1846,9 +1867,9 @@ fn main() -> BoxResult<()> {
         }
         _ => {}
     }
-    match (first_time, config.markdown_mode) {
+    match (first_time, config.csv_output_mode) {
         (true, OutputMode::First) | (_, OutputMode::Yes) => {
-            generate_markdown(epoch, &config)?;
+            generate_csv(epoch, &config)?;
         }
         _ => {}
     }
@@ -1864,19 +1885,11 @@ fn main() -> BoxResult<()> {
     Ok(())
 }
 
-fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
-    let markdown_path = config.db_path.join("md");
-    fs::create_dir_all(&markdown_path)?;
-
+fn generate_csv(epoch: Epoch, config: &Config) -> BoxResult<()> {
     let mut list = vec![(
         epoch,
         EpochClassification::load(epoch, &config.cluster_db_path())?.into_current(),
     )];
-
-    let cluster_md = match config.cluster {
-        Cluster::MainnetBeta => "Mainnet",
-        Cluster::Testnet => "Testnet",
-    };
 
     while let Some((epoch, epoch_classification)) =
         EpochClassification::load_previous(list.last().unwrap().0, &config.cluster_db_path())?
@@ -1926,90 +1939,6 @@ fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
     info!("Writing {}", filename.display());
     let mut file = File::create(filename)?;
     file.write_all(&validator_summary_csv.into_bytes())?;
-
-    let mut validators_markdown: HashMap<_, Vec<_>> = HashMap::default();
-    let mut cluster_markdown = vec![];
-    for (epoch, epoch_classification) in list.iter() {
-        cluster_markdown.push(format!("### Epoch {}", epoch));
-        for note in &epoch_classification.notes {
-            cluster_markdown.push(format!("* {}", note));
-        }
-
-        if let Some(ref validator_classifications) = epoch_classification.validator_classifications
-        {
-            let mut validator_classifications =
-                validator_classifications.iter().collect::<Vec<_>>();
-            validator_classifications.sort_by(|a, b| a.0.cmp(b.0));
-            for (identity, classification) in validator_classifications {
-                let validator_markdown = validators_markdown.entry(identity).or_default();
-
-                validator_markdown.push(format!(
-                    "### [[{1} Epoch {0}|{1}#Epoch-{0}]]",
-                    epoch, cluster_md
-                ));
-                let stake_state_streak = classification.stake_state_streak();
-                validator_markdown.push(format!(
-                    "* Stake level: **{:?}**{}",
-                    classification.stake_state,
-                    if stake_state_streak > 1 {
-                        format!(" (for {} epochs)", stake_state_streak)
-                    } else {
-                        "".to_string()
-                    }
-                ));
-                validator_markdown.push(format!(
-                    "* Stake reason: {}",
-                    classification.stake_state_reason
-                ));
-                if let Some(ref stake_action) = classification.stake_action {
-                    validator_markdown.push(format!("* Staking activity: {}", stake_action));
-                }
-
-                validator_markdown.push(format!(
-                    "* Vote account address: {}",
-                    classification.vote_address
-                ));
-                if let (Some(current_data_center), Some(data_center_residency)) = (
-                    classification.current_data_center.as_ref(),
-                    classification.data_center_residency.as_ref(),
-                ) {
-                    validator_markdown.push(format!("* Data Center: {}", current_data_center));
-
-                    if !data_center_residency.is_empty() {
-                        validator_markdown.push(format!(
-                            "* Resident Data Center(s): {}",
-                            data_center_residency
-                                .iter()
-                                .map(|(data_center, seniority)| format!(
-                                    "{} (seniority: {})",
-                                    data_center, seniority
-                                ))
-                                .collect::<Vec<String>>()
-                                .join(",")
-                        ));
-                    }
-                }
-
-                for note in &classification.notes {
-                    validator_markdown.push(format!("* {}", note));
-                }
-            }
-        }
-    }
-
-    for (identity, validator_markdown) in validators_markdown {
-        let markdown = validator_markdown.join("\n");
-        let filename = markdown_path.join(format!("Validator-{}.md", identity));
-        info!("Writing {}", filename.display());
-        let mut file = File::create(filename)?;
-        file.write_all(&markdown.into_bytes())?;
-    }
-
-    let markdown = cluster_markdown.join("\n");
-    let filename = markdown_path.join(format!("{}.md", cluster_md));
-    info!("Writing {}", filename.display());
-    let mut file = File::create(filename)?;
-    file.write_all(&markdown.into_bytes())?;
 
     Ok(())
 }

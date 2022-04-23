@@ -9,7 +9,7 @@ set -ex
 if [[ -n $FOLLOWER ]]; then
   REQUIRE_CLASSIFICATION="--require-classification"
 else
-  MARKDOWN="--markdown first"
+  CSV_OUTPUT_MODE="--csv-output-mode first"
   EPOCH_CLASSIFICATION="--epoch-classification first"
 fi
 
@@ -26,26 +26,28 @@ fi
 # shellcheck disable=SC2206
 TESTNET_ARGS=(
   --url ${URL:?}
+  --participant-url ${PARTICIPANT_URL:?}
   --cluster testnet
   --quality-block-producer-percentage 30
   --max-poor-block-producer-percentage 20
   --max-infrastructure-concentration 25
   --min-epoch-credit-percentage-of-average 35
   --infrastructure-concentration-affects destake-new
-  --min-release-version 1.9.3
+  --min-release-version 1.10.0
   --max-old-release-version-percentage 20
 )
 
 # shellcheck disable=SC2206
 MAINNET_BETA_ARGS=(
   --url ${URL:?}
+  --participant-url ${URL:?}
   --cluster mainnet-beta
   --quality-block-producer-percentage 30
   --max-poor-block-producer-percentage 20
   --min-epoch-credit-percentage-of-average 35
   --max-active-stake 3000000
   --max-commission 10
-  --min-release-version 1.8.14
+  --min-release-version 1.9.15
   --max-infrastructure-concentration 10
   --infrastructure-concentration-affects destake-new
   --min-self-stake 100
@@ -56,7 +58,7 @@ MAINNET_BETA_ARGS=(
 
 # shellcheck disable=SC2206
 NOT_A_STAKE_POOL_ARGS=(
-  $MARKDOWN
+  $CSV_OUTPUT_MODE
   $EPOCH_CLASSIFICATION
   $CONFIRM
   $REQUIRE_CLASSIFICATION
